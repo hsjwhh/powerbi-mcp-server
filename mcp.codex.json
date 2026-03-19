@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "powerbi": {
+      "command": "node",
+      "args": ["/absolute/path/to/power-bi/src/index.js"]
+    }
+  }
+}
