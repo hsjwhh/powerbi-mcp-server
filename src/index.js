@@ -6,7 +6,6 @@ import {
   ErrorCode,
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
-import { z } from "zod";
 import { PowerBIClient, normalizeExecuteQueryRows, toCsv } from "./powerbi.js";
 
 const client = new PowerBIClient();
@@ -14,7 +13,7 @@ const client = new PowerBIClient();
 const server = new Server(
   {
     name: "mcp-powerbi",
-    version: "0.1.0",
+    version: "0.1.1",
   },
   {
     capabilities: {
@@ -24,7 +23,7 @@ const server = new Server(
 );
 
 /**
- * 工具定义列表
+ * Tool definitions following MCP standards.
  */
 const TOOLS = [
   {
@@ -48,17 +47,17 @@ const TOOLS = [
   },
   {
     name: "list_datasets",
-    description: "List datasets (legacy API).",
+    description: "List datasets across all workspaces using legacy API.",
     inputSchema: {
       type: "object",
       properties: {
-        workspace_id: { type: "string", format: "uuid" },
+        workspace_id: { type: "string", format: "uuid", description: "Optional workspace filter" },
       },
     },
   },
   {
     name: "get_dataset_metadata",
-    description: "Get dataset schema (tables, columns, measures).",
+    description: "Get dataset schema (tables, columns, measures). Uses Push API or INFO.VIEW fallback. Note: INFO functions might not be supported in all environments.",
     inputSchema: {
       type: "object",
       properties: {
@@ -70,7 +69,7 @@ const TOOLS = [
   },
   {
     name: "describe_dataset",
-    description: "Return a compact dataset summary optimized for natural-language-to-DAX.",
+    description: "Return a compact dataset summary optimized for natural-language-to-DAX. Relies on INFO.VIEW functions.",
     inputSchema: {
       type: "object",
       properties: {
@@ -82,13 +81,13 @@ const TOOLS = [
   },
   {
     name: "get_semantic_model_definition",
-    description: "Get a Fabric semantic model definition (TMDL/TMSL).",
+    description: "Get a Fabric semantic model definition (TMDL/TMSL). TMDL format is recommended for AI readability.",
     inputSchema: {
       type: "object",
       properties: {
         workspace_id: { type: "string", format: "uuid" },
         semantic_model_id: { type: "string", format: "uuid" },
-        format: { type: "string", enum: ["TMSL", "TMDL"] },
+        format: { type: "string", enum: ["TMSL", "TMDL"], default: "TMDL" },
       },
       required: ["workspace_id", "semantic_model_id"],
     },
@@ -111,8 +110,8 @@ const TOOLS = [
                 type: "object",
                 properties: {
                   path: { type: "string" },
-                  payload: { type: "string" },
-                  payloadType: { type: "string", enum: ["InlineBase64"] },
+                  payload: { type: "string", description: "Base64 encoded content" },
+                  payloadType: { type: "string", enum: ["InlineBase64"], default: "InlineBase64" },
                 },
                 required: ["path", "payload"],
               },
@@ -125,14 +124,28 @@ const TOOLS = [
     },
   },
   {
-    name: "update_semantic_model_definition",
-    description: "Update a Fabric semantic model definition.",
+    name: "update_semantic_model",
+    description: "Update Fabric semantic model properties (display name or description).",
     inputSchema: {
       type: "object",
       properties: {
         workspace_id: { type: "string", format: "uuid" },
         semantic_model_id: { type: "string", format: "uuid" },
-        update_metadata: { type: "boolean" },
+        display_name: { type: "string" },
+        description: { type: "string" }
+      },
+      required: ["workspace_id", "semantic_model_id"]
+    }
+  },
+  {
+    name: "update_semantic_model_definition",
+    description: "Update a Fabric semantic model definition (schema/TMDL).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspace_id: { type: "string", format: "uuid" },
+        semantic_model_id: { type: "string", format: "uuid" },
+        update_metadata: { type: "boolean", default: false },
         definition: {
           type: "object",
           properties: {
@@ -142,7 +155,7 @@ const TOOLS = [
                 type: "object",
                 properties: {
                   path: { type: "string" },
-                  payload: { type: "string" },
+                  payload: { type: "string", description: "Base64 encoded content" },
                   payloadType: { type: "string", enum: ["InlineBase64"] },
                 },
                 required: ["path", "payload"],
@@ -157,7 +170,7 @@ const TOOLS = [
   },
   {
     name: "clone_semantic_model_to_new",
-    description: "Clone an existing semantic model into a new one.",
+    description: "Clone an existing semantic model. If target_workspace_id is omitted, clones to the source workspace. Note: Connection binding may be required after cloning.",
     inputSchema: {
       type: "object",
       properties: {
@@ -166,14 +179,27 @@ const TOOLS = [
         new_display_name: { type: "string" },
         target_workspace_id: { type: "string", format: "uuid" },
         new_description: { type: "string" },
-        format: { type: "string", enum: ["TMSL", "TMDL"] },
+        format: { type: "string", enum: ["TMSL", "TMDL"], default: "TMDL" },
       },
       required: ["source_workspace_id", "source_semantic_model_id", "new_display_name"],
     },
   },
   {
+    name: "bind_semantic_model_connection",
+    description: "Bind a semantic model to a data connection. Essential for cross-workspace clones or new models.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspace_id: { type: "string", format: "uuid" },
+        semantic_model_id: { type: "string", format: "uuid" },
+        connection_id: { type: "string", format: "uuid" }
+      },
+      required: ["workspace_id", "semantic_model_id", "connection_id"]
+    }
+  },
+  {
     name: "execute_dax_query",
-    description: "Execute a DAX query against a dataset.",
+    description: "Execute a DAX query against a dataset. Limits: 100k rows or 15MB.",
     inputSchema: {
       type: "object",
       properties: {
@@ -186,19 +212,24 @@ const TOOLS = [
   },
   {
     name: "refresh_dataset",
-    description: "Trigger a dataset refresh.",
+    description: "Trigger a dataset refresh. notify_option is required for Shared capacity.",
     inputSchema: {
       type: "object",
       properties: {
         workspace_id: { type: "string", format: "uuid" },
         dataset_id: { type: "string", format: "uuid" },
+        notify_option: { 
+          type: "string", 
+          enum: ["NoNotification", "MailOnFailure", "MailOnCompletion"],
+          default: "NoNotification"
+        }
       },
       required: ["workspace_id", "dataset_id"],
     },
   },
   {
     name: "export_data",
-    description: "Execute a DAX query and return the first table as CSV.",
+    description: "Execute a DAX query and return results as CSV. Note: API limits results to 100,000 rows or 15MB.",
     inputSchema: {
       type: "object",
       properties: {
@@ -209,17 +240,45 @@ const TOOLS = [
       required: ["workspace_id", "dataset_id", "query"],
     },
   },
+  {
+    name: "scan_workspace_metadata",
+    description: "Deep scan workspace metadata using Admin Scanner API. Requires POWERBI_USE_SCANNER=true and tenant admin permissions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspace_id: { type: "string", format: "uuid" }
+      },
+      required: ["workspace_id"]
+    }
+  }
 ];
 
 /**
- * 注册工具列表处理器
+ * Helper to check for truncation or query errors in executeQueries response.
+ */
+function checkQueryErrors(result) {
+  const warnings = [];
+  const queryResult = result?.results?.[0];
+  const tableResult = queryResult?.tables?.[0];
+
+  if (queryResult?.error) {
+    warnings.push(`Query Warning: ${JSON.stringify(queryResult.error)}`);
+  }
+  if (tableResult?.error) {
+    warnings.push(`Table Warning: ${JSON.stringify(tableResult.error)}`);
+  }
+  return warnings;
+}
+
+/**
+ * Register ListTools handler.
  */
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS,
 }));
 
 /**
- * 注册工具调用处理器
+ * Register CallTool handler.
  */
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
@@ -252,7 +311,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         try {
           data = await client.getDatasetTables(workspace_id, dataset_id);
         } catch (err) {
-          if (String(err).includes("not Push API dataset") || String(err).includes("Unauthorized")) {
+          // Robust check for status codes instead of string matching
+          if (err.statusCode === 400 || err.statusCode === 401 || err.statusCode === 404) {
             source = "info_view";
             data = await client.getDatasetMetadataViaInfoView(workspace_id, dataset_id);
           } else {
@@ -290,6 +350,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
 
+      case "update_semantic_model": {
+        const { workspace_id, semantic_model_id, display_name, description } = args;
+        const data = await client.fabricFetch(`/workspaces/${workspace_id}/semanticModels/${semantic_model_id}`, {
+          method: "PATCH",
+          body: { displayName: display_name, description }
+        });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+
       case "update_semantic_model_definition": {
         const { workspace_id, semantic_model_id, update_metadata, definition } = args;
         const data = await client.updateSemanticModelDefinition(
@@ -314,7 +383,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const definition = await client.getSemanticModelDefinition(
           source_workspace_id,
           source_semantic_model_id,
-          format
+          format || "TMDL"
         );
 
         const created = await client.createSemanticModel(target_workspace_id || source_workspace_id, {
@@ -326,24 +395,48 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: JSON.stringify(created, null, 2) }] };
       }
 
-      case "execute_dax_query": {
-        const { workspace_id, dataset_id, query } = args;
-        const data = await client.executeDaxQuery(workspace_id, dataset_id, query);
+      case "bind_semantic_model_connection": {
+        const { workspace_id, semantic_model_id, connection_id } = args;
+        // Mocking the specific call logic if not directly in client yet
+        const data = await client.fabricFetch(`/workspaces/${workspace_id}/semanticModels/${semantic_model_id}/connections/${connection_id}/bind`, {
+          method: "POST",
+          body: {}
+        });
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
 
+      case "execute_dax_query": {
+        const { workspace_id, dataset_id, query } = args;
+        const data = await client.executeDaxQuery(workspace_id, dataset_id, query);
+        const warnings = checkQueryErrors(data);
+        const response = { results: data.results, warnings: warnings.length ? warnings : undefined };
+        return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }] };
+      }
+
       case "refresh_dataset": {
-        const { workspace_id, dataset_id } = args;
-        const data = await client.refreshDataset(workspace_id, dataset_id);
+        const { workspace_id, dataset_id, notify_option } = args;
+        const data = await client.refreshDataset(workspace_id, dataset_id, { notifyOption: notify_option });
         return { content: [{ type: "text", text: JSON.stringify({ status: "accepted", data }, null, 2) }] };
       }
 
       case "export_data": {
         const { workspace_id, dataset_id, query } = args;
         const result = await client.executeDaxQuery(workspace_id, dataset_id, query);
+        const warnings = checkQueryErrors(result);
         const rows = normalizeExecuteQueryRows(result);
         const csv = toCsv(rows);
-        return { content: [{ type: "text", text: csv }] };
+        const output = warnings.length ? `⚠️ WARNING: ${warnings.join(", ")}\n\n${csv}` : csv;
+        return { content: [{ type: "text", text: output }] };
+      }
+
+      case "scan_workspace_metadata": {
+        const { workspace_id } = args;
+        const data = await client.scanWorkspaceMetadata(workspace_id, {
+          datasetExpressions: true,
+          datasourceDetails: true,
+          lineage: true
+        });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
 
       default:
@@ -358,7 +451,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 /**
- * 启动服务器
+ * Start the server.
  */
 async function main() {
   const transport = new StdioServerTransport();

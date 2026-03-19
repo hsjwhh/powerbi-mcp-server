@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.1.1] - 2026-03-19
+
+### Fixed
+
+- **DAX Query Truncation**: Added detection for `results[0].error` and `tables[0].error` in `execute_dax_query` and `export_data` tools.
+- **Shared Capacity Refresh**: Fixed `refresh_dataset` body to support `notifyOption` (required for Shared capacity).
+- **Metadata Reliability**: Implemented case-insensitive field matching for `INFO.VIEW` results.
+- **Rate Limiting**: Added HTTP 429 `Retry-After` handling with automatic retries in `apiFetch`.
+- **Concurrent Token Refresh**: Implemented a Promise-based lock in `getToken` to prevent redundant OAuth2 requests.
+- **Robust Error Handling**: Switched from fragile string matching to HTTP status code checks (400/401/404) for metadata fallbacks.
+
+### Added
+
+- **`update_semantic_model`**: Tool to update model name and description.
+- **`bind_semantic_model_connection`**: Tool to bind models to data connections (crucial for cross-workspace clones).
+- **`scan_workspace_metadata`**: Exposed the Admin Scanner API as a tool for deep workspace auditing.
+- **Concurrency & Isolation**: Refactored `listDatasetsAllGroups` to use `Promise.allSettled` for faster, isolated workspace traversal.
+
+### Changed
+
+- Unified all internal comments to English.
+- Refactored `PowerBIClient` to use constructor-initialized credentials, reducing redundant environment lookups.
+- Improved tool descriptions with official API limits and usage warnings.
+
 ## [0.1.0] - 2026-03-19
 
 ### Added

@@ -10,6 +10,9 @@ const DEFAULT_FABRIC_SCOPE = "https://api.fabric.microsoft.com/.default";
 
 loadDotEnv();
 
+/**
+ * Loads environment variables from .env file if it exists.
+ */
 function loadDotEnv() {
   const envPath = resolve(process.cwd(), ".env");
   if (!existsSync(envPath)) {
@@ -37,64 +40,85 @@ function loadDotEnv() {
   }
 }
 
-function requireEnv(name) {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`Missing required env var: ${name}`);
-  }
-  return value;
+/**
+ * Helper to get value from environment or throw.
+ */
+function getEnv(name) {
+  return process.env[name];
 }
 
 export class PowerBIClient {
   constructor(options = {}) {
-    this.tenantId = options.tenantId || process.env.POWERBI_TENANT_ID;
-    this.clientId = options.clientId || process.env.POWERBI_CLIENT_ID;
-    this.clientSecret = options.clientSecret || process.env.POWERBI_CLIENT_SECRET;
-    this.scope = options.scope || process.env.POWERBI_SCOPE || DEFAULT_SCOPE;
+    this.tenantId = options.tenantId || getEnv("POWERBI_TENANT_ID");
+    this.clientId = options.clientId || getEnv("POWERBI_CLIENT_ID");
+    this.clientSecret = options.clientSecret || getEnv("POWERBI_CLIENT_SECRET");
+    this.scope = options.scope || getEnv("POWERBI_SCOPE") || DEFAULT_SCOPE;
     this.fabricScope =
-      options.fabricScope || process.env.FABRIC_SCOPE || DEFAULT_FABRIC_SCOPE;
+      options.fabricScope || getEnv("FABRIC_SCOPE") || DEFAULT_FABRIC_SCOPE;
     this.userAgent = options.userAgent || "mcp-powerbi/0.1.0";
+    
+    // Token cache stores both the token/expiry and any pending refresh Promise
     this._tokenCache = new Map();
   }
 
+  /**
+   * Securely retrieves access token with concurrency locking.
+   */
   async getToken(scope) {
     const cached = this._tokenCache.get(scope);
-    if (cached && Date.now() < cached.expiresAt - 60_000) {
+    
+    // Check if we have a valid cached token
+    if (cached && cached.token && !(cached.token instanceof Promise) && Date.now() < cached.expiresAt - 60_000) {
       return cached.token;
     }
 
-    const tenantId = requireEnv("POWERBI_TENANT_ID");
-    const clientId = requireEnv("POWERBI_CLIENT_ID");
-    const clientSecret = requireEnv("POWERBI_CLIENT_SECRET");
-
-    const url = `${LOGIN_BASE}/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`;
-    const body = new URLSearchParams({
-      client_id: clientId,
-      client_secret: clientSecret,
-      scope,
-      grant_type: "client_credentials"
-    });
-
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded"
-      },
-      body
-    });
-
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Token request failed (${res.status}): ${text}`);
+    // If a refresh is already in progress, wait for it
+    if (cached && cached.token instanceof Promise) {
+      return cached.token;
     }
 
-    const data = await res.json();
-    const token = data.access_token;
-    this._tokenCache.set(scope, {
-      token,
-      expiresAt: Date.now() + (data.expires_in || 3600) * 1000
-    });
-    return token;
+    if (!this.tenantId || !this.clientId || !this.clientSecret) {
+      throw new Error("Missing required Power BI credentials (Tenant/Client ID or Secret).");
+    }
+
+    // Start a new refresh and store the Promise as a lock
+    const refreshPromise = (async () => {
+      try {
+        const url = `${LOGIN_BASE}/${encodeURIComponent(this.tenantId)}/oauth2/v2.0/token`;
+        const body = new URLSearchParams({
+          client_id: this.clientId,
+          client_secret: this.clientSecret,
+          scope,
+          grant_type: "client_credentials"
+        });
+
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body
+        });
+
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`Token request failed (${res.status}): ${text}`);
+        }
+
+        const data = await res.json();
+        const token = data.access_token;
+        this._tokenCache.set(scope, {
+          token,
+          expiresAt: Date.now() + (data.expires_in || 3600) * 1000
+        });
+        return token;
+      } catch (error) {
+        // Clear the failed Promise lock so next attempt can retry
+        this._tokenCache.delete(scope);
+        throw error;
+      }
+    })();
+
+    this._tokenCache.set(scope, { token: refreshPromise, expiresAt: Infinity });
+    return refreshPromise;
   }
 
   async getAccessToken() {
@@ -105,7 +129,10 @@ export class PowerBIClient {
     return this.getToken(this.fabricScope);
   }
 
-  async apiFetch(pathOrUrl, options = {}) {
+  /**
+   * Generic fetch for Power BI API with 429 retry and timeout support.
+   */
+  async apiFetch(pathOrUrl, options = {}, retries = 3) {
     const token = await this.getAccessToken();
     const url = pathOrUrl.startsWith("http")
       ? pathOrUrl
@@ -122,18 +149,30 @@ export class PowerBIClient {
       body: options.body ? JSON.stringify(options.body) : undefined
     }, options.timeoutMs);
 
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Power BI API error (${res.status}): ${text}`);
+    // Handle Rate Limiting (HTTP 429)
+    if (res.status === 429 && retries > 0) {
+      const retryAfter = Number(res.headers.get("retry-after") || 5);
+      await delay(retryAfter * 1000);
+      return this.apiFetch(pathOrUrl, options, retries - 1);
     }
 
-    if (res.status === 204) {
+    if (!res.ok) {
+      const text = await res.text();
+      const err = new Error(`Power BI API error (${res.status}): ${text}`);
+      err.statusCode = res.status;
+      throw err;
+    }
+
+    if (res.status === 204 || res.status === 202) {
       return null;
     }
 
     return res.json();
   }
 
+  /**
+   * Generic fetch for Fabric API with LRO polling support.
+   */
   async fabricFetch(pathOrUrl, options = {}) {
     const token = await this.getFabricAccessToken();
     const url = pathOrUrl.startsWith("http")
@@ -178,12 +217,22 @@ export class PowerBIClient {
       return this.pollFabricOperation(res, options);
     }
 
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Fabric API error (${res.status}): ${text}`);
+    // Still handle 429 for Fabric even though handleFabricResponse is called after first fetch
+    if (res.status === 429) {
+       const retryAfter = Number(res.headers.get("retry-after") || 5);
+       await delay(retryAfter * 1000);
+       // Simple one-time internal retry for Fabric start
+       return this.fabricFetch(res.url, options);
     }
 
-    if (res.status === 204) {
+    if (!res.ok) {
+      const text = await res.text();
+      const err = new Error(`Fabric API error (${res.status}): ${text}`);
+      err.statusCode = res.status;
+      throw err;
+    }
+
+    if (res.status === 204 || res.status === 202) {
       return null;
     }
 
@@ -314,14 +363,17 @@ export class PowerBIClient {
     return this.fetchAll(`${POWERBI_API_BASE}/groups/${groupId}/datasets`);
   }
 
+  /**
+   * Parallel traversal of all workspaces with error isolation.
+   */
   async listDatasetsAllGroups() {
     const workspaces = await this.listWorkspaces();
-    const results = [];
-
-    for (const ws of workspaces) {
-      const datasets = await this.listDatasetsInGroup(ws.id);
-      for (const ds of datasets) {
-        results.push({
+    
+    // Concurrently fetch datasets from each workspace using allSettled to isolate errors
+    const results = await Promise.allSettled(
+      workspaces.map(async (ws) => {
+        const datasets = await this.listDatasetsInGroup(ws.id);
+        return datasets.map((ds) => ({
           workspaceId: ws.id,
           workspaceName: ws.name,
           datasetId: ds.id,
@@ -329,11 +381,13 @@ export class PowerBIClient {
           addRowsAPIEnabled: ds.addRowsAPIEnabled,
           configuredBy: ds.configuredBy,
           isRefreshable: ds.isRefreshable
-        });
-      }
-    }
+        }));
+      })
+    );
 
-    return results;
+    return results
+      .filter((r) => r.status === "fulfilled")
+      .flatMap((r) => r.value);
   }
 
   async getDatasetTables(groupId, datasetId) {
@@ -351,6 +405,9 @@ export class PowerBIClient {
     });
   }
 
+  /**
+   * Robust metadata extraction using INFO.VIEW with field case-insensitivity.
+   */
   async getDatasetMetadataViaInfoView(groupId, datasetId) {
     const [tablesResult, columnsResult, measuresResult] = await Promise.all([
       this.executeDaxQuery(groupId, datasetId, "EVALUATE INFO.VIEW.TABLES()"),
@@ -358,17 +415,38 @@ export class PowerBIClient {
       this.executeDaxQuery(groupId, datasetId, "EVALUATE INFO.VIEW.MEASURES()")
     ]);
 
-    const tables = normalizeExecuteQueryRows(tablesResult);
-    const columns = normalizeExecuteQueryRows(columnsResult);
-    const measures = normalizeExecuteQueryRows(measuresResult);
+    const normalizeInfoViewRows = (result) => {
+      const rows = normalizeExecuteQueryRows(result);
+      return rows.map(row => {
+        const normalized = {};
+        for (const [key, val] of Object.entries(row)) {
+          // Normalize common fields for stability across Power BI versions
+          if (key.toLowerCase() === "ishidden") normalized.IsHidden = val;
+          if (key.toLowerCase() === "name") normalized.Name = val;
+          if (key.toLowerCase() === "table") normalized.Table = val;
+          normalized[key] = val;
+        }
+        return normalized;
+      });
+    };
 
-    return { tables, columns, measures };
+    return { 
+      tables: normalizeInfoViewRows(tablesResult), 
+      columns: normalizeInfoViewRows(columnsResult), 
+      measures: normalizeInfoViewRows(measuresResult) 
+    };
   }
 
-  async refreshDataset(groupId, datasetId) {
+  /**
+   * Triggers dataset refresh with support for notifyOption (critical for Shared capacity).
+   */
+  async refreshDataset(groupId, datasetId, options = {}) {
+    const body = {
+      notifyOption: options.notifyOption || "NoNotification"
+    };
     return this.apiFetch(`/groups/${groupId}/datasets/${datasetId}/refreshes`, {
       method: "POST",
-      body: {}
+      body
     });
   }
 
@@ -445,6 +523,9 @@ export class PowerBIClient {
   }
 }
 
+/**
+ * Converts result rows to CSV string with escaping.
+ */
 export function toCsv(rows) {
   if (!Array.isArray(rows) || rows.length === 0) {
     return "";
@@ -466,6 +547,9 @@ export function toCsv(rows) {
   return lines.join("\n");
 }
 
+/**
+ * Cleans up property names from executeQueries response (removes [Table] brackets).
+ */
 export function normalizeExecuteQueryRows(result) {
   const rows = result?.results?.[0]?.tables?.[0]?.rows || [];
   return rows.map((row) => {
