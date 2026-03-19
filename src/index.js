@@ -16,6 +16,11 @@ const server = new Server(
 );
 
 const client = new PowerBIClient();
+const definitionPartSchema = z.object({
+  path: z.string().min(1),
+  payload: z.string().min(1),
+  payloadType: z.enum(["InlineBase64"]).default("InlineBase64")
+});
 
 server.registerTool(
   "list_workspaces",
@@ -25,6 +30,27 @@ server.registerTool(
   },
   async () => {
     const data = await client.listWorkspaces();
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(data, null, 2)
+        }
+      ]
+    };
+  }
+);
+
+server.registerTool(
+  "list_semantic_models",
+  {
+    description: "List Fabric semantic models in a workspace.",
+    inputSchema: z.object({
+      workspace_id: z.string().uuid()
+    })
+  },
+  async ({ workspace_id }) => {
+    const data = await client.listSemanticModels(workspace_id);
     return {
       content: [
         {
@@ -165,6 +191,152 @@ server.registerTool(
               tables: visibleTables,
               columns: visibleColumns,
               measures
+            },
+            null,
+            2
+          )
+        }
+      ]
+    };
+  }
+);
+
+server.registerTool(
+  "get_semantic_model_definition",
+  {
+    description:
+      "Get a Fabric semantic model definition. Returns definition parts such as model.bim, definition.pbism, or TMDL files.",
+    inputSchema: z.object({
+      workspace_id: z.string().uuid(),
+      semantic_model_id: z.string().uuid(),
+      format: z.enum(["TMSL", "TMDL"]).optional()
+    })
+  },
+  async ({ workspace_id, semantic_model_id, format }) => {
+    const data = await client.getSemanticModelDefinition(
+      workspace_id,
+      semantic_model_id,
+      format
+    );
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(data, null, 2)
+        }
+      ]
+    };
+  }
+);
+
+server.registerTool(
+  "create_semantic_model",
+  {
+    description:
+      "Create a Fabric semantic model from a supplied definition. Definition parts must already be base64-encoded.",
+    inputSchema: z.object({
+      workspace_id: z.string().uuid(),
+      display_name: z.string().min(1),
+      description: z.string().optional(),
+      definition: z.object({
+        parts: z.array(definitionPartSchema).min(1)
+      })
+    })
+  },
+  async ({ workspace_id, display_name, description, definition }) => {
+    const data = await client.createSemanticModel(workspace_id, {
+      displayName: display_name,
+      description,
+      definition
+    });
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(data, null, 2)
+        }
+      ]
+    };
+  }
+);
+
+server.registerTool(
+  "update_semantic_model_definition",
+  {
+    description:
+      "Update a Fabric semantic model definition. Definition parts must already be base64-encoded.",
+    inputSchema: z.object({
+      workspace_id: z.string().uuid(),
+      semantic_model_id: z.string().uuid(),
+      update_metadata: z.boolean().optional(),
+      definition: z.object({
+        parts: z.array(definitionPartSchema).min(1)
+      })
+    })
+  },
+  async ({ workspace_id, semantic_model_id, update_metadata, definition }) => {
+    const data = await client.updateSemanticModelDefinition(
+      workspace_id,
+      semantic_model_id,
+      { definition },
+      update_metadata
+    );
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(data, null, 2)
+        }
+      ]
+    };
+  }
+);
+
+server.registerTool(
+  "clone_semantic_model_to_new",
+  {
+    description:
+      "Clone an existing Fabric semantic model into a new semantic model by reusing its definition.",
+    inputSchema: z.object({
+      source_workspace_id: z.string().uuid(),
+      source_semantic_model_id: z.string().uuid(),
+      new_display_name: z.string().min(1),
+      target_workspace_id: z.string().uuid().optional(),
+      new_description: z.string().optional(),
+      format: z.enum(["TMSL", "TMDL"]).optional()
+    })
+  },
+  async ({
+    source_workspace_id,
+    source_semantic_model_id,
+    new_display_name,
+    target_workspace_id,
+    new_description,
+    format
+  }) => {
+    const definition = await client.getSemanticModelDefinition(
+      source_workspace_id,
+      source_semantic_model_id,
+      format
+    );
+
+    const created = await client.createSemanticModel(target_workspace_id || source_workspace_id, {
+      displayName: new_display_name,
+      description: new_description,
+      definition: definition.definition
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              source_workspace_id,
+              source_semantic_model_id,
+              target_workspace_id: target_workspace_id || source_workspace_id,
+              new_display_name,
+              created
             },
             null,
             2

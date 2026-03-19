@@ -3,8 +3,10 @@ import { existsSync, readFileSync } from "fs";
 import { resolve } from "path";
 
 const POWERBI_API_BASE = "https://api.powerbi.com/v1.0/myorg";
+const FABRIC_API_BASE = "https://api.fabric.microsoft.com/v1";
 const LOGIN_BASE = "https://login.microsoftonline.com";
 const DEFAULT_SCOPE = "https://analysis.windows.net/powerbi/api/.default";
+const DEFAULT_FABRIC_SCOPE = "https://api.fabric.microsoft.com/.default";
 
 loadDotEnv();
 
@@ -49,20 +51,21 @@ export class PowerBIClient {
     this.clientId = options.clientId || process.env.POWERBI_CLIENT_ID;
     this.clientSecret = options.clientSecret || process.env.POWERBI_CLIENT_SECRET;
     this.scope = options.scope || process.env.POWERBI_SCOPE || DEFAULT_SCOPE;
+    this.fabricScope =
+      options.fabricScope || process.env.FABRIC_SCOPE || DEFAULT_FABRIC_SCOPE;
     this.userAgent = options.userAgent || "mcp-powerbi/0.1.0";
-    this._token = null;
-    this._tokenExpiresAt = 0;
+    this._tokenCache = new Map();
   }
 
-  async getAccessToken() {
-    if (this._token && Date.now() < this._tokenExpiresAt - 60_000) {
-      return this._token;
+  async getToken(scope) {
+    const cached = this._tokenCache.get(scope);
+    if (cached && Date.now() < cached.expiresAt - 60_000) {
+      return cached.token;
     }
 
     const tenantId = requireEnv("POWERBI_TENANT_ID");
     const clientId = requireEnv("POWERBI_CLIENT_ID");
     const clientSecret = requireEnv("POWERBI_CLIENT_SECRET");
-    const scope = this.scope;
 
     const url = `${LOGIN_BASE}/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`;
     const body = new URLSearchParams({
@@ -86,9 +89,20 @@ export class PowerBIClient {
     }
 
     const data = await res.json();
-    this._token = data.access_token;
-    this._tokenExpiresAt = Date.now() + (data.expires_in || 3600) * 1000;
-    return this._token;
+    const token = data.access_token;
+    this._tokenCache.set(scope, {
+      token,
+      expiresAt: Date.now() + (data.expires_in || 3600) * 1000
+    });
+    return token;
+  }
+
+  async getAccessToken() {
+    return this.getToken(this.scope);
+  }
+
+  async getFabricAccessToken() {
+    return this.getToken(this.fabricScope);
   }
 
   async apiFetch(pathOrUrl, options = {}) {
@@ -97,7 +111,7 @@ export class PowerBIClient {
       ? pathOrUrl
       : `${POWERBI_API_BASE}${pathOrUrl}`;
 
-    const res = await fetch(url, {
+    const res = await this.fetchWithTimeout(url, {
       method: options.method || "GET",
       headers: {
         "Authorization": `Bearer ${token}`,
@@ -106,7 +120,7 @@ export class PowerBIClient {
         ...(options.headers || {})
       },
       body: options.body ? JSON.stringify(options.body) : undefined
-    });
+    }, options.timeoutMs);
 
     if (!res.ok) {
       const text = await res.text();
@@ -118,6 +132,150 @@ export class PowerBIClient {
     }
 
     return res.json();
+  }
+
+  async fabricFetch(pathOrUrl, options = {}) {
+    const token = await this.getFabricAccessToken();
+    const url = pathOrUrl.startsWith("http")
+      ? pathOrUrl
+      : `${FABRIC_API_BASE}${pathOrUrl}`;
+
+    const res = await this.fetchWithTimeout(url, {
+      method: options.method || "GET",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "User-Agent": this.userAgent,
+        ...(options.headers || {})
+      },
+      body: options.body ? JSON.stringify(options.body) : undefined
+    }, options.timeoutMs);
+
+    return this.handleFabricResponse(res, options);
+  }
+
+  async fetchWithTimeout(url, init, timeoutMs = 30_000) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      return await fetch(url, {
+        ...init,
+        signal: controller.signal
+      });
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        throw new Error(`Request timeout after ${timeoutMs}ms for ${url}`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async handleFabricResponse(res, options = {}) {
+    if (res.status === 202) {
+      return this.pollFabricOperation(res, options);
+    }
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Fabric API error (${res.status}): ${text}`);
+    }
+
+    if (res.status === 204) {
+      return null;
+    }
+
+    const text = await res.text();
+    return text ? JSON.parse(text) : null;
+  }
+
+  async pollFabricOperation(res, options = {}) {
+    const operationId = res.headers.get("x-ms-operation-id");
+    let location = res.headers.get("location");
+    if (!location && operationId) {
+      location = `${FABRIC_API_BASE}/operations/${operationId}`;
+    }
+
+    if (!location) {
+      throw new Error("Fabric LRO did not provide a polling URL.");
+    }
+
+    const timeoutMs = options.timeoutMs || 120_000;
+    const deadline = Date.now() + timeoutMs;
+    let pollUrl = location;
+    let lastResponse = res;
+
+    while (Date.now() < deadline) {
+      const retryAfterSeconds = Number(lastResponse.headers.get("retry-after") || 2);
+      await delay(Math.max(retryAfterSeconds, 1) * 1000);
+
+      const token = await this.getFabricAccessToken();
+      const pollRes = await this.fetchWithTimeout(pollUrl, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "User-Agent": this.userAgent
+        }
+      }, 30_000);
+
+      if (pollRes.status === 202) {
+        const nextLocation = pollRes.headers.get("location");
+        if (nextLocation) {
+          pollUrl = nextLocation;
+        }
+        lastResponse = pollRes;
+        continue;
+      }
+
+      if (!pollRes.ok) {
+        const text = await pollRes.text();
+        throw new Error(`Fabric LRO polling error (${pollRes.status}): ${text}`);
+      }
+
+      const nextLocation = pollRes.headers.get("location");
+      const body = await this.parseJsonResponse(pollRes);
+
+      if (!body || !body.status) {
+        if (nextLocation && nextLocation !== pollUrl) {
+          pollUrl = nextLocation;
+          lastResponse = pollRes;
+          continue;
+        }
+        return body;
+      }
+
+      if (body.status === "Succeeded") {
+        const resultUrl =
+          (nextLocation && nextLocation !== pollUrl && nextLocation) ||
+          (operationId ? `/operations/${operationId}/result` : null);
+
+        if (resultUrl) {
+          return this.fabricFetch(resultUrl, { method: "GET", timeoutMs: 15_000 });
+        }
+        return {
+          ...body,
+          operationId,
+          resultUrl
+        };
+      }
+
+      if (body.status === "Failed" || body.status === "Canceled") {
+        throw new Error(`Fabric LRO failed: ${JSON.stringify(body)}`);
+      }
+
+      if (nextLocation) {
+        pollUrl = nextLocation;
+      }
+      lastResponse = pollRes;
+    }
+
+    throw new Error("Fabric LRO timeout waiting for operation completion.");
+  }
+
+  async parseJsonResponse(res) {
+    const text = await res.text();
+    return text ? JSON.parse(text) : null;
   }
 
   async fetchAll(url) {
@@ -135,6 +293,21 @@ export class PowerBIClient {
 
   async listWorkspaces() {
     return this.fetchAll(`${POWERBI_API_BASE}/groups`);
+  }
+
+  async listSemanticModels(workspaceId) {
+    const items = [];
+    let next = `/workspaces/${workspaceId}/semanticModels`;
+
+    while (next) {
+      const data = await this.fabricFetch(next);
+      if (Array.isArray(data?.value)) {
+        items.push(...data.value);
+      }
+      next = data?.continuationUri || null;
+    }
+
+    return items;
   }
 
   async listDatasetsInGroup(groupId) {
@@ -197,6 +370,41 @@ export class PowerBIClient {
       method: "POST",
       body: {}
     });
+  }
+
+  async getSemanticModel(workspaceId, semanticModelId) {
+    return this.fabricFetch(`/workspaces/${workspaceId}/semanticModels/${semanticModelId}`);
+  }
+
+  async getSemanticModelDefinition(workspaceId, semanticModelId, format) {
+    const suffix = format ? `?format=${encodeURIComponent(format)}` : "";
+    return this.fabricFetch(
+      `/workspaces/${workspaceId}/semanticModels/${semanticModelId}/getDefinition${suffix}`,
+      {
+        method: "POST"
+      }
+    );
+  }
+
+  async createSemanticModel(workspaceId, body) {
+    return this.fabricFetch(`/workspaces/${workspaceId}/semanticModels`, {
+      method: "POST",
+      body
+    });
+  }
+
+  async updateSemanticModelDefinition(workspaceId, semanticModelId, body, updateMetadata) {
+    const suffix =
+      typeof updateMetadata === "boolean"
+        ? `?updateMetadata=${encodeURIComponent(String(updateMetadata))}`
+        : "";
+    return this.fabricFetch(
+      `/workspaces/${workspaceId}/semanticModels/${semanticModelId}/updateDefinition${suffix}`,
+      {
+        method: "POST",
+        body
+      }
+    );
   }
 
   async scanWorkspaceMetadata(groupId, options = {}) {
