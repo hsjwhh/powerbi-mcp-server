@@ -41,7 +41,7 @@ function loadDotEnv() {
 }
 
 /**
- * Helper to get value from environment or throw.
+ * Helper to get value from environment.
  */
 function getEnv(name) {
   return process.env[name];
@@ -55,24 +55,21 @@ export class PowerBIClient {
     this.scope = options.scope || getEnv("POWERBI_SCOPE") || DEFAULT_SCOPE;
     this.fabricScope =
       options.fabricScope || getEnv("FABRIC_SCOPE") || DEFAULT_FABRIC_SCOPE;
-    this.userAgent = options.userAgent || "mcp-powerbi/0.1.0";
+    this.userAgent = options.userAgent || "mcp-powerbi/0.1.1";
     
-    // Token cache stores both the token/expiry and any pending refresh Promise
     this._tokenCache = new Map();
   }
 
   /**
-   * Securely retrieves access token with concurrency locking.
+   * Securely retrieves access token with concurrency locking and improved logging.
    */
   async getToken(scope) {
     const cached = this._tokenCache.get(scope);
     
-    // Check if we have a valid cached token
     if (cached && cached.token && !(cached.token instanceof Promise) && Date.now() < cached.expiresAt - 60_000) {
       return cached.token;
     }
 
-    // If a refresh is already in progress, wait for it
     if (cached && cached.token instanceof Promise) {
       return cached.token;
     }
@@ -81,7 +78,6 @@ export class PowerBIClient {
       throw new Error("Missing required Power BI credentials (Tenant/Client ID or Secret).");
     }
 
-    // Start a new refresh and store the Promise as a lock
     const refreshPromise = (async () => {
       try {
         const url = `${LOGIN_BASE}/${encodeURIComponent(this.tenantId)}/oauth2/v2.0/token`;
@@ -111,7 +107,7 @@ export class PowerBIClient {
         });
         return token;
       } catch (error) {
-        // Clear the failed Promise lock so next attempt can retry
+        console.error(`[PowerBIClient] Token refresh failed for scope ${scope}:`, error.message);
         this._tokenCache.delete(scope);
         throw error;
       }
@@ -130,7 +126,7 @@ export class PowerBIClient {
   }
 
   /**
-   * Generic fetch for Power BI API with 429 retry and timeout support.
+   * Power BI API fetch. Fix: 202 is NOT a terminal null response for non-Fabric APIs.
    */
   async apiFetch(pathOrUrl, options = {}, retries = 3) {
     const token = await this.getAccessToken();
@@ -149,7 +145,6 @@ export class PowerBIClient {
       body: options.body ? JSON.stringify(options.body) : undefined
     }, options.timeoutMs);
 
-    // Handle Rate Limiting (HTTP 429)
     if (res.status === 429 && retries > 0) {
       const retryAfter = Number(res.headers.get("retry-after") || 5);
       await delay(retryAfter * 1000);
@@ -160,18 +155,22 @@ export class PowerBIClient {
       const text = await res.text();
       const err = new Error(`Power BI API error (${res.status}): ${text}`);
       err.statusCode = res.status;
+      err.headers = res.headers;
       throw err;
     }
 
-    if (res.status === 204 || res.status === 202) {
+    if (res.status === 204) {
       return null;
     }
 
-    return res.json();
+    // 202 in Power BI (e.g. Refresh) might have a body or just headers. 
+    // If it's empty, res.json() will fail.
+    const text = await res.text();
+    return text ? JSON.parse(text) : null;
   }
 
   /**
-   * Generic fetch for Fabric API with LRO polling support.
+   * Fabric API fetch. Pass original pathOrUrl to handler for robust retries.
    */
   async fabricFetch(pathOrUrl, options = {}) {
     const token = await this.getFabricAccessToken();
@@ -190,7 +189,7 @@ export class PowerBIClient {
       body: options.body ? JSON.stringify(options.body) : undefined
     }, options.timeoutMs);
 
-    return this.handleFabricResponse(res, options);
+    return this.handleFabricResponse(res, pathOrUrl, options);
   }
 
   async fetchWithTimeout(url, init, timeoutMs = 30_000) {
@@ -212,17 +211,15 @@ export class PowerBIClient {
     }
   }
 
-  async handleFabricResponse(res, options = {}) {
+  async handleFabricResponse(res, originalPath, options = {}) {
     if (res.status === 202) {
       return this.pollFabricOperation(res, options);
     }
 
-    // Still handle 429 for Fabric even though handleFabricResponse is called after first fetch
     if (res.status === 429) {
        const retryAfter = Number(res.headers.get("retry-after") || 5);
        await delay(retryAfter * 1000);
-       // Simple one-time internal retry for Fabric start
-       return this.fabricFetch(res.url, options);
+       return this.fabricFetch(originalPath, options);
     }
 
     if (!res.ok) {
@@ -232,7 +229,7 @@ export class PowerBIClient {
       throw err;
     }
 
-    if (res.status === 204 || res.status === 202) {
+    if (res.status === 204) {
       return null;
     }
 
@@ -282,37 +279,25 @@ export class PowerBIClient {
         throw new Error(`Fabric LRO polling error (${pollRes.status}): ${text}`);
       }
 
-      const nextLocation = pollRes.headers.get("location");
       const body = await this.parseJsonResponse(pollRes);
 
       if (!body || !body.status) {
-        if (nextLocation && nextLocation !== pollUrl) {
-          pollUrl = nextLocation;
-          lastResponse = pollRes;
-          continue;
-        }
         return body;
       }
 
       if (body.status === "Succeeded") {
-        const resultUrl =
-          (nextLocation && nextLocation !== pollUrl && nextLocation) ||
-          (operationId ? `/operations/${operationId}/result` : null);
-
+        const resultUrl = operationId ? `/operations/${operationId}/result` : null;
         if (resultUrl) {
           return this.fabricFetch(resultUrl, { method: "GET", timeoutMs: 15_000 });
         }
-        return {
-          ...body,
-          operationId,
-          resultUrl
-        };
+        return body;
       }
 
       if (body.status === "Failed" || body.status === "Canceled") {
         throw new Error(`Fabric LRO failed: ${JSON.stringify(body)}`);
       }
 
+      const nextLocation = pollRes.headers.get("location");
       if (nextLocation) {
         pollUrl = nextLocation;
       }
@@ -363,13 +348,8 @@ export class PowerBIClient {
     return this.fetchAll(`${POWERBI_API_BASE}/groups/${groupId}/datasets`);
   }
 
-  /**
-   * Parallel traversal of all workspaces with error isolation.
-   */
   async listDatasetsAllGroups() {
     const workspaces = await this.listWorkspaces();
-    
-    // Concurrently fetch datasets from each workspace using allSettled to isolate errors
     const results = await Promise.allSettled(
       workspaces.map(async (ws) => {
         const datasets = await this.listDatasetsInGroup(ws.id);
@@ -406,7 +386,7 @@ export class PowerBIClient {
   }
 
   /**
-   * Robust metadata extraction using INFO.VIEW with field case-insensitivity.
+   * Generalized PascalCase normalization for INFO.VIEW results.
    */
   async getDatasetMetadataViaInfoView(groupId, datasetId) {
     const [tablesResult, columnsResult, measuresResult] = await Promise.all([
@@ -415,31 +395,25 @@ export class PowerBIClient {
       this.executeDaxQuery(groupId, datasetId, "EVALUATE INFO.VIEW.MEASURES()")
     ]);
 
-    const normalizeInfoViewRows = (result) => {
+    const toPascal = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+    const normalizeRows = (result) => {
       const rows = normalizeExecuteQueryRows(result);
       return rows.map(row => {
         const normalized = {};
         for (const [key, val] of Object.entries(row)) {
-          // Normalize common fields for stability across Power BI versions
-          if (key.toLowerCase() === "ishidden") normalized.IsHidden = val;
-          if (key.toLowerCase() === "name") normalized.Name = val;
-          if (key.toLowerCase() === "table") normalized.Table = val;
-          normalized[key] = val;
+          normalized[toPascal(key)] = val;
         }
         return normalized;
       });
     };
 
     return { 
-      tables: normalizeInfoViewRows(tablesResult), 
-      columns: normalizeInfoViewRows(columnsResult), 
-      measures: normalizeInfoViewRows(measuresResult) 
+      tables: normalizeRows(tablesResult), 
+      columns: normalizeRows(columnsResult), 
+      measures: normalizeRows(measuresResult) 
     };
   }
 
-  /**
-   * Triggers dataset refresh with support for notifyOption (critical for Shared capacity).
-   */
   async refreshDataset(groupId, datasetId, options = {}) {
     const body = {
       notifyOption: options.notifyOption || "NoNotification"
@@ -523,9 +497,6 @@ export class PowerBIClient {
   }
 }
 
-/**
- * Converts result rows to CSV string with escaping.
- */
 export function toCsv(rows) {
   if (!Array.isArray(rows) || rows.length === 0) {
     return "";
@@ -547,9 +518,6 @@ export function toCsv(rows) {
   return lines.join("\n");
 }
 
-/**
- * Cleans up property names from executeQueries response (removes [Table] brackets).
- */
 export function normalizeExecuteQueryRows(result) {
   const rows = result?.results?.[0]?.tables?.[0]?.rows || [];
   return rows.map((row) => {

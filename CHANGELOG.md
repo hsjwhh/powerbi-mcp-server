@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.1.2] - 2026-03-19
+
+### Fixed
+
+- **Critical**: Reverted 202 status code handling in `apiFetch` to prevent swallowing asynchronous response headers (e.g., for dataset refreshes).
+- **Critical**: Corrected `bind_semantic_model_connection` API path to follow the Fabric `/items/{id}/connections` pattern.
+- **Robustness**: Improved `fabricFetch` retries by preserving the original path/URL, avoiding potential Issues with `res.url`.
+- **Normalization**: Generalized `INFO.VIEW` field normalization to PascalCase for all keys, ensuring full compatibility with various Power BI versions.
+- **Reliability**: Filtered `undefined` values from `update_semantic_model` PATCH body to avoid API schema validation errors.
+- **Observability**: Added error logging to `getToken` for easier debugging in Stdio environments.
+
 ## [0.1.1] - 2026-03-19
 
 ### Fixed

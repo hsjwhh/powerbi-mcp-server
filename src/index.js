@@ -13,7 +13,7 @@ const client = new PowerBIClient();
 const server = new Server(
   {
     name: "mcp-powerbi",
-    version: "0.1.1",
+    version: "0.1.2",
   },
   {
     capabilities: {
@@ -186,7 +186,7 @@ const TOOLS = [
   },
   {
     name: "bind_semantic_model_connection",
-    description: "Bind a semantic model to a data connection. Essential for cross-workspace clones or new models.",
+    description: "Bind a semantic model to a data connection. Required for cross-workspace clones. Path based on Fabric items connection pattern.",
     inputSchema: {
       type: "object",
       properties: {
@@ -311,7 +311,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         try {
           data = await client.getDatasetTables(workspace_id, dataset_id);
         } catch (err) {
-          // Robust check for status codes instead of string matching
           if (err.statusCode === 400 || err.statusCode === 401 || err.statusCode === 404) {
             source = "info_view";
             data = await client.getDatasetMetadataViaInfoView(workspace_id, dataset_id);
@@ -352,9 +351,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "update_semantic_model": {
         const { workspace_id, semantic_model_id, display_name, description } = args;
+        // Filter undefined to avoid API errors
+        const body = {};
+        if (display_name !== undefined) body.displayName = display_name;
+        if (description !== undefined) body.description = description;
+
         const data = await client.fabricFetch(`/workspaces/${workspace_id}/semanticModels/${semantic_model_id}`, {
           method: "PATCH",
-          body: { displayName: display_name, description }
+          body
         });
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
@@ -397,8 +401,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "bind_semantic_model_connection": {
         const { workspace_id, semantic_model_id, connection_id } = args;
-        // Mocking the specific call logic if not directly in client yet
-        const data = await client.fabricFetch(`/workspaces/${workspace_id}/semanticModels/${semantic_model_id}/connections/${connection_id}/bind`, {
+        // Correct Fabric item connection bind path
+        const data = await client.fabricFetch(`/workspaces/${workspace_id}/items/${semantic_model_id}/connections/${connection_id}/bind`, {
           method: "POST",
           body: {}
         });
