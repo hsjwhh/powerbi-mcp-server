@@ -1,422 +1,372 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  ErrorCode,
+  McpError,
+} from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { PowerBIClient, normalizeExecuteQueryRows, toCsv } from "./powerbi.js";
+
+const client = new PowerBIClient();
 
 const server = new Server(
   {
     name: "mcp-powerbi",
-    version: "0.1.0"
+    version: "0.1.0",
   },
   {
     capabilities: {
-      tools: {}
-    }
+      tools: {},
+    },
   }
 );
 
-const client = new PowerBIClient();
-const definitionPartSchema = z.object({
-  path: z.string().min(1),
-  payload: z.string().min(1),
-  payloadType: z.enum(["InlineBase64"]).default("InlineBase64")
-});
-
-server.registerTool(
-  "list_workspaces",
+/**
+ * 工具定义列表
+ */
+const TOOLS = [
   {
+    name: "list_workspaces",
     description: "List workspaces accessible to the configured service principal.",
-    inputSchema: z.object({})
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
   },
-  async () => {
-    const data = await client.listWorkspaces();
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(data, null, 2)
-        }
-      ]
-    };
-  }
-);
-
-server.registerTool(
-  "list_semantic_models",
   {
+    name: "list_semantic_models",
     description: "List Fabric semantic models in a workspace.",
-    inputSchema: z.object({
-      workspace_id: z.string().uuid()
-    })
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspace_id: { type: "string", format: "uuid" },
+      },
+      required: ["workspace_id"],
+    },
   },
-  async ({ workspace_id }) => {
-    const data = await client.listSemanticModels(workspace_id);
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(data, null, 2)
-        }
-      ]
-    };
-  }
-);
-
-server.registerTool(
-  "list_datasets",
   {
-    description:
-      "List datasets. If workspace_id is provided, lists datasets in that workspace; otherwise returns datasets across all workspaces.",
-    inputSchema: z.object({
-      workspace_id: z.string().uuid().optional()
-    })
+    name: "list_datasets",
+    description: "List datasets (legacy API).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspace_id: { type: "string", format: "uuid" },
+      },
+    },
   },
-  async ({ workspace_id }) => {
-    const data = workspace_id
-      ? await client.listDatasetsInGroup(workspace_id)
-      : await client.listDatasetsAllGroups();
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(data, null, 2)
-        }
-      ]
-    };
-  }
-);
-
-server.registerTool(
-  "get_dataset_metadata",
   {
-    description:
-      "Get dataset schema (tables, columns, measures). Uses Push Dataset tables endpoint when available, otherwise falls back to INFO.VIEW DAX queries for standard semantic models; optionally falls back to Admin Scanner API when POWERBI_USE_SCANNER=true.",
-    inputSchema: z.object({
-      workspace_id: z.string().uuid(),
-      dataset_id: z.string().uuid()
-    })
+    name: "get_dataset_metadata",
+    description: "Get dataset schema (tables, columns, measures).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspace_id: { type: "string", format: "uuid" },
+        dataset_id: { type: "string", format: "uuid" },
+      },
+      required: ["workspace_id", "dataset_id"],
+    },
   },
-  async ({ workspace_id, dataset_id }) => {
-    let data = null;
-    let source = "push_tables";
+  {
+    name: "describe_dataset",
+    description: "Return a compact dataset summary optimized for natural-language-to-DAX.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspace_id: { type: "string", format: "uuid" },
+        dataset_id: { type: "string", format: "uuid" },
+      },
+      required: ["workspace_id", "dataset_id"],
+    },
+  },
+  {
+    name: "get_semantic_model_definition",
+    description: "Get a Fabric semantic model definition (TMDL/TMSL).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspace_id: { type: "string", format: "uuid" },
+        semantic_model_id: { type: "string", format: "uuid" },
+        format: { type: "string", enum: ["TMSL", "TMDL"] },
+      },
+      required: ["workspace_id", "semantic_model_id"],
+    },
+  },
+  {
+    name: "create_semantic_model",
+    description: "Create a Fabric semantic model from a supplied definition.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspace_id: { type: "string", format: "uuid" },
+        display_name: { type: "string" },
+        description: { type: "string" },
+        definition: {
+          type: "object",
+          properties: {
+            parts: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  path: { type: "string" },
+                  payload: { type: "string" },
+                  payloadType: { type: "string", enum: ["InlineBase64"] },
+                },
+                required: ["path", "payload"],
+              },
+            },
+          },
+          required: ["parts"],
+        },
+      },
+      required: ["workspace_id", "display_name", "definition"],
+    },
+  },
+  {
+    name: "update_semantic_model_definition",
+    description: "Update a Fabric semantic model definition.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspace_id: { type: "string", format: "uuid" },
+        semantic_model_id: { type: "string", format: "uuid" },
+        update_metadata: { type: "boolean" },
+        definition: {
+          type: "object",
+          properties: {
+            parts: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  path: { type: "string" },
+                  payload: { type: "string" },
+                  payloadType: { type: "string", enum: ["InlineBase64"] },
+                },
+                required: ["path", "payload"],
+              },
+            },
+          },
+          required: ["parts"],
+        },
+      },
+      required: ["workspace_id", "semantic_model_id", "definition"],
+    },
+  },
+  {
+    name: "clone_semantic_model_to_new",
+    description: "Clone an existing semantic model into a new one.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source_workspace_id: { type: "string", format: "uuid" },
+        source_semantic_model_id: { type: "string", format: "uuid" },
+        new_display_name: { type: "string" },
+        target_workspace_id: { type: "string", format: "uuid" },
+        new_description: { type: "string" },
+        format: { type: "string", enum: ["TMSL", "TMDL"] },
+      },
+      required: ["source_workspace_id", "source_semantic_model_id", "new_display_name"],
+    },
+  },
+  {
+    name: "execute_dax_query",
+    description: "Execute a DAX query against a dataset.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspace_id: { type: "string", format: "uuid" },
+        dataset_id: { type: "string", format: "uuid" },
+        query: { type: "string" },
+      },
+      required: ["workspace_id", "dataset_id", "query"],
+    },
+  },
+  {
+    name: "refresh_dataset",
+    description: "Trigger a dataset refresh.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspace_id: { type: "string", format: "uuid" },
+        dataset_id: { type: "string", format: "uuid" },
+      },
+      required: ["workspace_id", "dataset_id"],
+    },
+  },
+  {
+    name: "export_data",
+    description: "Execute a DAX query and return the first table as CSV.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspace_id: { type: "string", format: "uuid" },
+        dataset_id: { type: "string", format: "uuid" },
+        query: { type: "string" },
+      },
+      required: ["workspace_id", "dataset_id", "query"],
+    },
+  },
+];
 
-    try {
-      data = await client.getDatasetTables(workspace_id, dataset_id);
-    } catch (err) {
-      const message = String(err);
-      const shouldTryInfoView =
-        message.includes("not Push API dataset") ||
-        message.includes("does not have write access") ||
-        message.includes("PowerBIEntityNotFound") ||
-        message.includes("Unauthorized");
+/**
+ * 注册工具列表处理器
+ */
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: TOOLS,
+}));
 
-      if (shouldTryInfoView) {
-        source = "info_view";
-        data = await client.getDatasetMetadataViaInfoView(workspace_id, dataset_id);
-      } else {
-        const useScanner = String(process.env.POWERBI_USE_SCANNER || "").toLowerCase() === "true";
-        if (!useScanner) {
-          throw err;
+/**
+ * 注册工具调用处理器
+ */
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+
+  try {
+    switch (name) {
+      case "list_workspaces": {
+        const data = await client.listWorkspaces();
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+
+      case "list_semantic_models": {
+        const { workspace_id } = args;
+        const data = await client.listSemanticModels(workspace_id);
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+
+      case "list_datasets": {
+        const { workspace_id } = args;
+        const data = workspace_id
+          ? await client.listDatasetsInGroup(workspace_id)
+          : await client.listDatasetsAllGroups();
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+
+      case "get_dataset_metadata": {
+        const { workspace_id, dataset_id } = args;
+        let data = null;
+        let source = "push_tables";
+        try {
+          data = await client.getDatasetTables(workspace_id, dataset_id);
+        } catch (err) {
+          if (String(err).includes("not Push API dataset") || String(err).includes("Unauthorized")) {
+            source = "info_view";
+            data = await client.getDatasetMetadataViaInfoView(workspace_id, dataset_id);
+          } else {
+            throw err;
+          }
         }
-        source = "scanner";
-        const scan = await client.scanWorkspaceMetadata(workspace_id, {
-          datasetExpressions: true,
-          datasourceDetails: false,
-          lineage: false
+        return { content: [{ type: "text", text: JSON.stringify({ source, data }, null, 2) }] };
+      }
+
+      case "describe_dataset": {
+        const { workspace_id, dataset_id } = args;
+        const metadata = await client.getDatasetMetadataViaInfoView(workspace_id, dataset_id);
+        const summary = {
+          dataset_id,
+          tables: metadata.tables.filter(t => !t.IsHidden).map(t => ({ name: t.Name, storage_mode: t.StorageMode })),
+          columns: metadata.columns.filter(c => !c.IsHidden).map(c => ({ table: c.Table, name: c.Name, data_type: c.DataType })),
+          measures: metadata.measures.map(m => ({ table: m.Table, name: m.Name, expression: m.Expression }))
+        };
+        return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
+      }
+
+      case "get_semantic_model_definition": {
+        const { workspace_id, semantic_model_id, format } = args;
+        const data = await client.getSemanticModelDefinition(workspace_id, semantic_model_id, format);
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+
+      case "create_semantic_model": {
+        const { workspace_id, display_name, description, definition } = args;
+        const data = await client.createSemanticModel(workspace_id, {
+          displayName: display_name,
+          description,
+          definition
+        });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+
+      case "update_semantic_model_definition": {
+        const { workspace_id, semantic_model_id, update_metadata, definition } = args;
+        const data = await client.updateSemanticModelDefinition(
+          workspace_id,
+          semantic_model_id,
+          { definition },
+          update_metadata
+        );
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+
+      case "clone_semantic_model_to_new": {
+        const {
+          source_workspace_id,
+          source_semantic_model_id,
+          new_display_name,
+          target_workspace_id,
+          new_description,
+          format
+        } = args;
+        
+        const definition = await client.getSemanticModelDefinition(
+          source_workspace_id,
+          source_semantic_model_id,
+          format
+        );
+
+        const created = await client.createSemanticModel(target_workspace_id || source_workspace_id, {
+          displayName: new_display_name,
+          description: new_description,
+          definition: definition.definition
         });
 
-        const ws = (scan.workspaces || []).find((w) => w.id === workspace_id);
-        const dataset = ws?.datasets?.find((d) => d.id === dataset_id);
-        if (!dataset) {
-          throw new Error("Dataset not found in scanner result.");
-        }
-        data = dataset;
+        return { content: [{ type: "text", text: JSON.stringify(created, null, 2) }] };
       }
+
+      case "execute_dax_query": {
+        const { workspace_id, dataset_id, query } = args;
+        const data = await client.executeDaxQuery(workspace_id, dataset_id, query);
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+
+      case "refresh_dataset": {
+        const { workspace_id, dataset_id } = args;
+        const data = await client.refreshDataset(workspace_id, dataset_id);
+        return { content: [{ type: "text", text: JSON.stringify({ status: "accepted", data }, null, 2) }] };
+      }
+
+      case "export_data": {
+        const { workspace_id, dataset_id, query } = args;
+        const result = await client.executeDaxQuery(workspace_id, dataset_id, query);
+        const rows = normalizeExecuteQueryRows(result);
+        const csv = toCsv(rows);
+        return { content: [{ type: "text", text: csv }] };
+      }
+
+      default:
+        throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
     }
-
+  } catch (error) {
     return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({ source, data }, null, 2)
-        }
-      ]
+      content: [{ type: "text", text: `Error: ${error.message}` }],
+      isError: true,
     };
   }
-);
+});
 
-server.registerTool(
-  "describe_dataset",
-  {
-    description:
-      "Return a compact dataset summary optimized for natural-language-to-DAX workflows, including visible tables, columns, and measures.",
-    inputSchema: z.object({
-      workspace_id: z.string().uuid(),
-      dataset_id: z.string().uuid()
-    })
-  },
-  async ({ workspace_id, dataset_id }) => {
-    const metadata = await client.getDatasetMetadataViaInfoView(workspace_id, dataset_id);
-    const visibleTables = metadata.tables
-      .filter((table) => !table.IsHidden)
-      .map((table) => ({
-        name: table.Name,
-        storage_mode: table.StorageMode
-      }));
+/**
+ * 启动服务器
+ */
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error("Power BI MCP Server running on stdio");
+}
 
-    const visibleColumns = metadata.columns
-      .filter((column) => !column.IsHidden)
-      .map((column) => ({
-        table: column.Table,
-        name: column.Name,
-        data_type: column.DataType,
-        summarize_by: column.SummarizeBy
-      }));
-
-    const measures = metadata.measures.map((measure) => ({
-      table: measure.Table,
-      name: measure.Name,
-      expression: measure.Expression,
-      format_string: measure.FormatString
-    }));
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              dataset_id,
-              tables: visibleTables,
-              columns: visibleColumns,
-              measures
-            },
-            null,
-            2
-          )
-        }
-      ]
-    };
-  }
-);
-
-server.registerTool(
-  "get_semantic_model_definition",
-  {
-    description:
-      "Get a Fabric semantic model definition. Returns definition parts such as model.bim, definition.pbism, or TMDL files.",
-    inputSchema: z.object({
-      workspace_id: z.string().uuid(),
-      semantic_model_id: z.string().uuid(),
-      format: z.enum(["TMSL", "TMDL"]).optional()
-    })
-  },
-  async ({ workspace_id, semantic_model_id, format }) => {
-    const data = await client.getSemanticModelDefinition(
-      workspace_id,
-      semantic_model_id,
-      format
-    );
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(data, null, 2)
-        }
-      ]
-    };
-  }
-);
-
-server.registerTool(
-  "create_semantic_model",
-  {
-    description:
-      "Create a Fabric semantic model from a supplied definition. Definition parts must already be base64-encoded.",
-    inputSchema: z.object({
-      workspace_id: z.string().uuid(),
-      display_name: z.string().min(1),
-      description: z.string().optional(),
-      definition: z.object({
-        parts: z.array(definitionPartSchema).min(1)
-      })
-    })
-  },
-  async ({ workspace_id, display_name, description, definition }) => {
-    const data = await client.createSemanticModel(workspace_id, {
-      displayName: display_name,
-      description,
-      definition
-    });
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(data, null, 2)
-        }
-      ]
-    };
-  }
-);
-
-server.registerTool(
-  "update_semantic_model_definition",
-  {
-    description:
-      "Update a Fabric semantic model definition. Definition parts must already be base64-encoded.",
-    inputSchema: z.object({
-      workspace_id: z.string().uuid(),
-      semantic_model_id: z.string().uuid(),
-      update_metadata: z.boolean().optional(),
-      definition: z.object({
-        parts: z.array(definitionPartSchema).min(1)
-      })
-    })
-  },
-  async ({ workspace_id, semantic_model_id, update_metadata, definition }) => {
-    const data = await client.updateSemanticModelDefinition(
-      workspace_id,
-      semantic_model_id,
-      { definition },
-      update_metadata
-    );
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(data, null, 2)
-        }
-      ]
-    };
-  }
-);
-
-server.registerTool(
-  "clone_semantic_model_to_new",
-  {
-    description:
-      "Clone an existing Fabric semantic model into a new semantic model by reusing its definition.",
-    inputSchema: z.object({
-      source_workspace_id: z.string().uuid(),
-      source_semantic_model_id: z.string().uuid(),
-      new_display_name: z.string().min(1),
-      target_workspace_id: z.string().uuid().optional(),
-      new_description: z.string().optional(),
-      format: z.enum(["TMSL", "TMDL"]).optional()
-    })
-  },
-  async ({
-    source_workspace_id,
-    source_semantic_model_id,
-    new_display_name,
-    target_workspace_id,
-    new_description,
-    format
-  }) => {
-    const definition = await client.getSemanticModelDefinition(
-      source_workspace_id,
-      source_semantic_model_id,
-      format
-    );
-
-    const created = await client.createSemanticModel(target_workspace_id || source_workspace_id, {
-      displayName: new_display_name,
-      description: new_description,
-      definition: definition.definition
-    });
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              source_workspace_id,
-              source_semantic_model_id,
-              target_workspace_id: target_workspace_id || source_workspace_id,
-              new_display_name,
-              created
-            },
-            null,
-            2
-          )
-        }
-      ]
-    };
-  }
-);
-
-server.registerTool(
-  "execute_dax_query",
-  {
-    description: "Execute a DAX query against a dataset.",
-    inputSchema: z.object({
-      workspace_id: z.string().uuid(),
-      dataset_id: z.string().uuid(),
-      query: z.string().min(1)
-    })
-  },
-  async ({ workspace_id, dataset_id, query }) => {
-    const data = await client.executeDaxQuery(workspace_id, dataset_id, query);
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(data, null, 2)
-        }
-      ]
-    };
-  }
-);
-
-server.registerTool(
-  "refresh_dataset",
-  {
-    description: "Trigger a dataset refresh.",
-    inputSchema: z.object({
-      workspace_id: z.string().uuid(),
-      dataset_id: z.string().uuid()
-    })
-  },
-  async ({ workspace_id, dataset_id }) => {
-    const data = await client.refreshDataset(workspace_id, dataset_id);
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({ status: "accepted", data }, null, 2)
-        }
-      ]
-    };
-  }
-);
-
-server.registerTool(
-  "export_data",
-  {
-    description: "Execute a DAX query and return the first table as CSV.",
-    inputSchema: z.object({
-      workspace_id: z.string().uuid(),
-      dataset_id: z.string().uuid(),
-      query: z.string().min(1)
-    })
-  },
-  async ({ workspace_id, dataset_id, query }) => {
-    const result = await client.executeDaxQuery(workspace_id, dataset_id, query);
-    const rows = normalizeExecuteQueryRows(result);
-    const csv = toCsv(rows);
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: csv
-        }
-      ]
-    };
-  }
-);
-
-const transport = new StdioServerTransport();
-await server.connect(transport);
+main().catch((error) => {
+  console.error("Server error:", error);
+  process.exit(1);
+});
