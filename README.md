@@ -46,6 +46,37 @@ npm install
 npm start
 ```
 
+## Docker
+
+构建镜像：
+
+```bash
+docker build -t powerbi-mcp-server .
+```
+
+运行容器：
+
+```bash
+docker run --rm -i \
+  -e POWERBI_TENANT_ID=your-tenant-id \
+  -e POWERBI_CLIENT_ID=your-client-id \
+  -e POWERBI_CLIENT_SECRET=your-client-secret \
+  powerbi-mcp-server
+```
+
+说明：
+
+- MCP 通过 `stdio` 工作，因此容器运行时需要保留标准输入输出
+- 若要使用 Fabric SemanticModel API，可额外传入 `FABRIC_SCOPE`
+
+使用 Compose：
+
+```bash
+docker compose up --build
+```
+
+Compose 会从当前 shell 环境或同目录 `.env` 读取变量。发布或共享配置时，不要提交真实凭据。
+
 ## 文档
 
 - `API.md`: MCP 工具接口详细说明

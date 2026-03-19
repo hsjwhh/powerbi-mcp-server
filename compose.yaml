@@ -1,0 +1,15 @@
+services:
+  powerbi-mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: powerbi-mcp-server:latest
+    stdin_open: true
+    tty: false
+    environment:
+      POWERBI_TENANT_ID: ${POWERBI_TENANT_ID}
+      POWERBI_CLIENT_ID: ${POWERBI_CLIENT_ID}
+      POWERBI_CLIENT_SECRET: ${POWERBI_CLIENT_SECRET}
+      POWERBI_SCOPE: ${POWERBI_SCOPE:-https://analysis.windows.net/powerbi/api/.default}
+      FABRIC_SCOPE: ${FABRIC_SCOPE:-https://api.fabric.microsoft.com/.default}
+      POWERBI_USE_SCANNER: ${POWERBI_USE_SCANNER:-false}
